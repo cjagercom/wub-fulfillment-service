@@ -1,0 +1,14 @@
+printWidth: 150
+semi: false
+singleQuote: true
+bracketSpacing: true
+bracketSameLine: true
+endOfLine: auto
+arrowParens: avoid
+trailingComma: none
+tabWidth: 2
+useTabs: false
+tailwindFunctions:
+  - classnames
+  - cva
+  - cn
