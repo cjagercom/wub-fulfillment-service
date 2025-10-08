@@ -6,6 +6,7 @@ export default async function inventoryRoutes(app: FastifyInstance) {
     '',
     {
       schema: {
+        tags: ['inventory'],
         querystring: {
           type: 'object',
           required: ['organizationId'],

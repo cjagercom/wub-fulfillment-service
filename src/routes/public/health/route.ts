@@ -1,9 +1,27 @@
 import { FastifyInstance } from 'fastify'
-import { healthSchema } from './schema.js'
 
 export default async function healthRoutes(app: FastifyInstance) {
-  app.get('', { schema: healthSchema }, async () => ({
-    ok: true,
-    ts: Date.now()
-  }))
+  app.get(
+    '',
+    {
+      schema: {
+        tags: ['public'],
+        hide: true,
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              ts: { type: 'number' }
+            },
+            required: ['ok', 'ts']
+          }
+        }
+      }
+    },
+    async () => ({
+      ok: true,
+      ts: Date.now()
+    })
+  )
 }
