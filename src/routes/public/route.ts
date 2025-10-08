@@ -1,4 +1,5 @@
 import { FastifyInstance } from 'fastify'
-export default async function r(app: FastifyInstance) {
-  app.get('/', async () => ({ name: 'WUB Fulfillment API', docs: '/', api: '/api/v1' }))
+
+export default async function (app: FastifyInstance) {
+  app.get('/', (_req, reply) => reply.code(302).redirect('/docs'))
 }
