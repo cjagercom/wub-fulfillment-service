@@ -42,7 +42,7 @@ export function buildServer() {
   app.register(swagger, {
     openapi: { info: { title: 'WUB Fulfillment API', version: '1.0.0' } }
   })
-  app.register(swaggerUI, { routePrefix: '/docs', logLevel: 'warn' })
+  app.register(swaggerUI, { routePrefix: '/', logLevel: 'warn' })
 
   // public
   app.register(async scope => {
