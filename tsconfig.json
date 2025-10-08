@@ -8,5 +8,5 @@
     "outDir": "dist",
     "skipLibCheck": true
   },
-  "include": ["src", "tools"]
+  "include": ["src", "tools", "api/index.js"]
 }
