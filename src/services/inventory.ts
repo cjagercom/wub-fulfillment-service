@@ -19,7 +19,7 @@ async function fetchOrgInventoryFromDB(organizationId: string): Promise<Inventor
     SELECT
       p.id AS product_id,
       p.organization_id,
-      COALESCE(i.sku, p.slug) AS sku,
+      COALESCE(i.sku, p.sku) AS sku,
       COALESCE(i.ean, p.ean) AS ean,
       p.title,
       GREATEST(COALESCE(i.amount, 0) - COALESCE(i.reserved, 0), 0) AS amount,
@@ -59,7 +59,7 @@ export async function getSingleProductFromCacheOrDB(organizationId: string, prod
     SELECT
       p.id AS product_id,
       p.organization_id,
-      COALESCE(i.sku, p.slug) AS sku,
+      COALESCE(i.sku, p.sku) AS sku,
       COALESCE(i.ean, p.ean) AS ean,
       p.title,
       GREATEST(COALESCE(i.amount, 0) - COALESCE(i.reserved, 0), 0) AS amount,
@@ -86,69 +86,99 @@ export async function getSingleProductFromCacheOrDB(organizationId: string, prod
   return row
 }
 
-/** Reserveer voorraad (verlaag amount atomair); mock calls naar Monta; refresh cache */
-export async function reserveProduct(opts: { organizationId: string; productIdOrKey: string; quantity: number }) {
-  const { organizationId, productIdOrKey, quantity } = opts
-  if (quantity <= 0) throw new Error('quantity must be > 0')
+type SetReservationResult =
+  | { ok: true; amount: number; reserved: number; available_after: number }
+  | { ok: false; reason: 'insufficient_stock' | 'stale_previous_quantity' | 'not_found' }
 
-  let result: { ok: true; amount: number } | { ok: false; reason: 'insufficient_stock' } = { ok: false, reason: 'insufficient_stock' }
+export async function setReservationFromCart(opts: {
+  organizationId: string
+  productIdOrKey: string
+  previous: number // oude cart-waarde (>= 0)
+  next: number // nieuwe cart-waarde (>= 0)
+}): Promise<SetReservationResult> {
+  const { organizationId, productIdOrKey, previous, next } = opts
+
+  if (previous < 0 || next < 0) throw new Error('previous/next must be >= 0')
 
   await sql`BEGIN`
   try {
-    // Product-id binnen organisatie opzoeken
+    // Vind product_id binnen organisatie op basis van id/slug/ean/sku
     const prod = (
       await sql`
-      SELECT p.id AS product_id
-      FROM products p
-      LEFT JOIN inventory i ON i.product_id = p.id
-      WHERE p.organization_id = ${organizationId}
-        AND (p.id::text = ${productIdOrKey}
-             OR p.slug = ${productIdOrKey}
-             OR p.ean = ${productIdOrKey}
-             OR i.sku = ${productIdOrKey}
-             OR i.ean = ${productIdOrKey})
-      LIMIT 1;
-    `
+        SELECT p.id AS product_id
+        FROM products p
+        LEFT JOIN inventory i ON i.product_id = p.id
+        WHERE p.organization_id = ${organizationId}
+          AND (p.id::text = ${productIdOrKey}
+               OR p.slug = ${productIdOrKey}
+               OR p.ean = ${productIdOrKey}
+               OR i.sku = ${productIdOrKey}
+               OR i.ean = ${productIdOrKey})
+        LIMIT 1;
+      `
     )[0]
+
     if (!prod) {
       await sql`ROLLBACK`
-      return result // insufficient_stock
+      return { ok: false, reason: 'not_found' }
     }
 
-    // Verlaag reserved; blokkeer als niet genoeg
+    // Atomisch: reserved = reserved - previous + next
+    // Voorwaarden:
+    // - reserved >= previous  (optimistische lock tegen verouderde cart)
+    // - (amount - reserved + previous) >= next  (voldoende vrije voorraad)
     const updated = (
       await sql`
         UPDATE inventory
-        SET reserved = reserved + ${quantity}, updated_at = NOW()
+        SET reserved = reserved - ${previous} + ${next},
+            updated_at = NOW()
         WHERE product_id = ${prod.product_id}
           AND organization_id = ${organizationId}
-          AND (amount - reserved) >= ${quantity}
+          AND reserved >= ${previous}
+          AND (amount - reserved + ${previous}) >= ${next}
         RETURNING amount, reserved, (amount - reserved) AS available_after;
       `
     )[0]
 
     if (!updated) {
+      // Bepaal of het een stale-previous of voorraad-issue is
+      const current = (
+        await sql`
+          SELECT amount, reserved FROM inventory
+          WHERE product_id = ${prod.product_id} AND organization_id = ${organizationId}
+          LIMIT 1;
+        `
+      )[0]
+
       await sql`ROLLBACK`
-      return result // insufficient_stock
+
+      if (!current) return { ok: false, reason: 'not_found' }
+      if (current.reserved < previous) return { ok: false, reason: 'stale_previous_quantity' }
+      // Anders is het gebrek aan vrije voorraad
+      return { ok: false, reason: 'insufficient_stock' }
     }
 
     await sql`COMMIT`
 
-    // Mock calls naar Monta
-    console.info('[MONTA][reserve]', { organizationId, productId: prod.product_id, quantity })
-    console.info('[MONTA][get_stock_after_reserve]', { productId: prod.product_id, by: 'sku-or-ean' })
-
-    // Mock: Monta zegt dezelfde amount terug
-    const montaAmount = updated.amount
+    // (optioneel) Mock Monta-calls zoals je dat al deed
+    console.info('[MONTA][reserve:set]', {
+      organizationId,
+      productId: prod.product_id,
+      from: previous,
+      to: next
+    })
 
     // Cache verversen
     const fresh = await fetchOrgInventoryFromDB(organizationId)
     setOrgInventory(organizationId, fresh)
 
-    result = { ok: true, amount: montaAmount }
-    return result
+    return {
+      ok: true,
+      amount: updated.amount,
+      reserved: updated.reserved,
+      available_after: updated.available_after
+    }
   } catch (err) {
-    // probeer rollback, maar gooi de originele fout opnieuw
     await sql`ROLLBACK`.catch(() => {
       console.warn('[TX] rollback failed (likely no open transaction)')
     })
