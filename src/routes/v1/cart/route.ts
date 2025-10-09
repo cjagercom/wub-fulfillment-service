@@ -5,6 +5,7 @@ import { setReservationFromCart } from '../../../services/inventory.js'
 type CartBody = {
   organizationId: string
   productIdOrKey: string
+  cartId: string
   quantity: number
   previousQuantity?: number
 }
@@ -15,13 +16,14 @@ export default async function cartRoutes(app: FastifyInstance) {
     {
       schema: {
         tags: ['cart'],
-        summary: 'Set reserved stock for a cart change (previous → next); use previous 0 in case of new item to cart.',
+        summary: 'Set reserved stock for a cart change (previous → next); per-cart tracked for expiry',
         body: {
           type: 'object',
-          required: ['organizationId', 'productIdOrKey', 'quantity'],
+          required: ['organizationId', 'productIdOrKey', 'cartId', 'quantity'],
           properties: {
             organizationId: { type: 'string' },
             productIdOrKey: { type: 'string' },
+            cartId: { type: 'string' },
             quantity: { type: 'integer', minimum: 0 },
             previousQuantity: { type: 'integer', minimum: 0, default: 0 }
           }
@@ -29,20 +31,20 @@ export default async function cartRoutes(app: FastifyInstance) {
       }
     },
     async (req, res) => {
-      const { organizationId, productIdOrKey, quantity, previousQuantity = 0 } = req.body as CartBody
+      const { organizationId, productIdOrKey, cartId, quantity, previousQuantity = 0 } = req.body as CartBody
 
       const result = await setReservationFromCart({
         organizationId,
         productIdOrKey,
+        cartId,
         previous: previousQuantity,
         next: quantity
       })
 
       if (!result.ok) {
-        const status = result.reason === 'not_found' ? 404 : result.reason === 'stale_previous_quantity' ? 409 : 409 // insufficient_stock
+        const status = result.reason === 'not_found' ? 404 : 409
         return res.code(status).send({ message: result.reason })
       }
-
       return result
     }
   )

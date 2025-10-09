@@ -1,6 +1,6 @@
 // src/services/inventory.ts
 import { sql } from '../db/connect.js'
-import { getOrgInventory, setOrgInventory } from '../lib/cache.js'
+import { clearOrgInventory, getOrgInventory, setOrgInventory } from '../lib/cache.js'
 
 export type InventoryRow = {
   product_id: string
@@ -9,8 +9,6 @@ export type InventoryRow = {
   ean: string | null
   title: string
   amount: number
-  reserved: number
-  threshold: number
 }
 
 /** Alle inventory voor een org uit DB ophalen */
@@ -22,9 +20,7 @@ async function fetchOrgInventoryFromDB(organizationId: string): Promise<Inventor
       COALESCE(i.sku, p.sku) AS sku,
       COALESCE(i.ean, p.ean) AS ean,
       p.title,
-      GREATEST(COALESCE(i.amount, 0) - COALESCE(i.reserved, 0), 0) AS amount,
-      COALESCE(i.reserved, 0) AS reserved,
-      COALESCE(i.threshold, 0) AS threshold
+      GREATEST(COALESCE(i.amount, 0) - COALESCE(i.reserved, 0), 0) AS amount
     FROM products p
     LEFT JOIN inventory i ON i.product_id = p.id
     WHERE p.organization_id = ${organizationId}
@@ -62,9 +58,7 @@ export async function getSingleProductFromCacheOrDB(organizationId: string, prod
       COALESCE(i.sku, p.sku) AS sku,
       COALESCE(i.ean, p.ean) AS ean,
       p.title,
-      GREATEST(COALESCE(i.amount, 0) - COALESCE(i.reserved, 0), 0) AS amount,
-      COALESCE(i.reserved, 0) AS reserved,
-      COALESCE(i.threshold, 0) AS threshold
+      GREATEST(COALESCE(i.amount, 0) - COALESCE(i.reserved, 0), 0) AS amount
     FROM products p
     LEFT JOIN inventory i ON i.product_id = p.id
     WHERE p.organization_id = ${organizationId}
@@ -86,179 +80,188 @@ export async function getSingleProductFromCacheOrDB(organizationId: string, prod
   return row
 }
 
+// services/inventory.ts
 type SetReservationResult =
   | { ok: true; amount: number; reserved: number; available_after: number }
-  | { ok: false; reason: 'insufficient_stock' | 'stale_previous_quantity' | 'not_found' }
+  | { ok: false; reason: 'insufficient_stock' | 'not_found' }
 
 export async function setReservationFromCart(opts: {
   organizationId: string
   productIdOrKey: string
-  previous: number // oude cart-waarde (>= 0)
-  next: number // nieuwe cart-waarde (>= 0)
+  cartId: string
+  previous: number
+  next: number
 }): Promise<SetReservationResult> {
-  const { organizationId, productIdOrKey, previous, next } = opts
-
+  const { organizationId, productIdOrKey, cartId, previous, next } = opts
   if (previous < 0 || next < 0) throw new Error('previous/next must be >= 0')
+
+  const delta = next - previous
 
   await sql`BEGIN`
   try {
-    // Vind product_id binnen organisatie op basis van id/slug/ean/sku
     const prod = (
       await sql`
-        SELECT p.id AS product_id
-        FROM products p
-        LEFT JOIN inventory i ON i.product_id = p.id
-        WHERE p.organization_id = ${organizationId}
-          AND (p.id::text = ${productIdOrKey}
-               OR p.slug = ${productIdOrKey}
-               OR p.ean = ${productIdOrKey}
-               OR i.sku = ${productIdOrKey}
-               OR i.ean = ${productIdOrKey})
-        LIMIT 1;
-      `
+      SELECT p.id AS product_id
+      FROM products p
+      LEFT JOIN inventory i ON i.product_id = p.id
+      WHERE p.organization_id = ${organizationId}
+        AND (p.id::text = ${productIdOrKey}
+             OR p.slug = ${productIdOrKey}
+             OR p.ean = ${productIdOrKey}
+             OR i.sku = ${productIdOrKey}
+             OR i.ean = ${productIdOrKey})
+      LIMIT 1;
+    `
     )[0]
-
     if (!prod) {
       await sql`ROLLBACK`
       return { ok: false, reason: 'not_found' }
     }
 
-    // Atomisch: reserved = reserved - previous + next
-    // Voorwaarden:
-    // - reserved >= previous  (optimistische lock tegen verouderde cart)
-    // - (amount - reserved + previous) >= next  (voldoende vrije voorraad)
-    const updated = (
-      await sql`
+    if (delta !== 0) {
+      // Guards op voorraad: delta>0 -> genoeg vrij; delta<0 -> genoeg gereserveerd in totaliteit
+      const ok =
+        (
+          await sql`
         UPDATE inventory
-        SET reserved = reserved - ${previous} + ${next},
-            updated_at = NOW()
-        WHERE product_id = ${prod.product_id}
-          AND organization_id = ${organizationId}
-          AND reserved >= ${previous}
-          AND (amount - reserved + ${previous}) >= ${next}
-        RETURNING amount, reserved, (amount - reserved) AS available_after;
+           SET updated_at = NOW()
+         WHERE product_id = ${prod.product_id}
+           AND organization_id = ${organizationId}
+           AND (
+                (${delta} > 0 AND (amount - reserved) >= ${delta})
+             OR (${delta} < 0 AND reserved >= ${-delta})
+           )
+        RETURNING 1;
       `
-    )[0]
+        ).length > 0
+      if (!ok) {
+        await sql`ROLLBACK`
+        return { ok: false, reason: 'insufficient_stock' }
+      }
 
-    if (!updated) {
-      // Bepaal of het een stale-previous of voorraad-issue is
-      const current = (
-        await sql`
-          SELECT amount, reserved FROM inventory
-          WHERE product_id = ${prod.product_id} AND organization_id = ${organizationId}
-          LIMIT 1;
-        `
-      )[0]
-
-      await sql`ROLLBACK`
-
-      if (!current) return { ok: false, reason: 'not_found' }
-      if (current.reserved < previous) return { ok: false, reason: 'stale_previous_quantity' }
-      // Anders is het gebrek aan vrije voorraad
-      return { ok: false, reason: 'insufficient_stock' }
+      // UPSERT per cart
+      await sql`
+        INSERT INTO inventory_reservations (organization_id, product_id, cart_id, qty)
+        VALUES (${organizationId}, ${prod.product_id}, ${cartId}, ${next})
+        ON CONFLICT (organization_id, product_id, cart_id)
+        DO UPDATE SET qty = EXCLUDED.qty, updated_at = NOW();
+      `
+      // trigger werkt nu de inventory.reserved bij met delta
     }
+
+    const cur = (
+      await sql`
+      SELECT amount, reserved, (amount - reserved) AS available_after
+      FROM inventory
+      WHERE product_id = ${prod.product_id} AND organization_id = ${organizationId}
+      LIMIT 1;
+    `
+    )[0]
 
     await sql`COMMIT`
 
-    // (optioneel) Mock Monta-calls zoals je dat al deed
-    console.info('[MONTA][reserve:set]', {
-      organizationId,
-      productId: prod.product_id,
-      from: previous,
-      to: next
-    })
-
-    // Cache verversen
-    const fresh = await fetchOrgInventoryFromDB(organizationId)
-    setOrgInventory(organizationId, fresh)
-
-    return {
-      ok: true,
-      amount: updated.amount,
-      reserved: updated.reserved,
-      available_after: updated.available_after
-    }
-  } catch (err) {
-    await sql`ROLLBACK`.catch(() => {
-      console.warn('[TX] rollback failed (likely no open transaction)')
-    })
-    throw err
+    if (!cur) return { ok: false, reason: 'not_found' }
+    clearOrgInventory(organizationId)
+    return { ok: true, amount: cur.amount, reserved: cur.reserved, available_after: cur.available_after }
+  } catch (e) {
+    await sql`ROLLBACK`.catch(() => {})
+    throw e
   }
 }
 
-// --- fulfill (na betaling): mock ship + mock stock refresh; update DB + cache; bundel “threshold” mail
 export async function fulfillOrder(opts: { organizationId: string; items: Array<{ productIdOrKey: string; quantity: number }>; orderId: string }) {
   const { organizationId, items, orderId } = opts
 
-  console.info('[MONTA][ship_order]', { organizationId, orderId, items })
+  // 1) Merge by productIdOrKey (voorkomt dubbele aftrek bij herhaalde entries in payload)
+  const merged = new Map<string, number>()
+  for (const it of items) {
+    if (it.quantity <= 0) continue
+    merged.set(it.productIdOrKey, (merged.get(it.productIdOrKey) ?? 0) + it.quantity)
+  }
 
   const low: Array<{ title: string; amount: number; threshold: number }> = []
 
   await sql`BEGIN`
   try {
-    for (const it of items) {
+    for (const [productIdOrKey, qty] of merged) {
       const found = (
         await sql`
-      SELECT
-        p.id AS product_id,
-        p.title
-      FROM products p
-      LEFT JOIN inventory i ON i.product_id = p.id
-      WHERE p.organization_id = ${organizationId}
-        AND (p.id::text = ${it.productIdOrKey}
-             OR p.slug = ${it.productIdOrKey}
-             OR p.ean = ${it.productIdOrKey}
-             OR i.sku = ${it.productIdOrKey}
-             OR i.ean = ${it.productIdOrKey})
-      LIMIT 1;
-    `
+          SELECT p.id AS product_id, p.title
+          FROM products p
+          LEFT JOIN inventory i ON i.product_id = p.id
+          WHERE p.organization_id = ${organizationId}
+            AND (
+              p.id::text = ${productIdOrKey}
+              OR p.slug = ${productIdOrKey}
+              OR p.ean = ${productIdOrKey}
+              OR i.sku = ${productIdOrKey}
+              OR i.ean = ${productIdOrKey}
+            )
+          LIMIT 1;
+        `
       )[0]
-      if (!found) continue
-
-      // reservering definitief maken: amount én reserved omlaag met dezelfde qty
-      const after = (
-        await sql`
-      UPDATE inventory
-      SET
-        amount     = amount    - ${it.quantity},
-        reserved   = reserved  - ${it.quantity},
-        updated_at = NOW()
-      WHERE product_id = ${found.product_id}
-        AND organization_id = ${organizationId}
-        AND reserved >= ${it.quantity}
-      RETURNING amount, threshold, ${found.title} AS title;
-    `
-      )[0]
-
-      // als reserved te laag was, is er niets geüpdatet; sla over of log
-      if (!after) {
-        console.warn('[FULFILL][skip] reserved too low', { productId: found.product_id, quantity: it.quantity })
+      if (!found) {
+        console.warn('[FULFILL][skip] product not found', { key: productIdOrKey })
         continue
       }
 
-      // optioneel: alleen logging naar “MONTA”
-      console.info('[MONTA][get_stock_after_ship]', { productId: found.product_id })
+      // 2) Idempotency: probeer deze order+product-combinatie te registreren
+      const firstTime =
+        (
+          await sql`
+          INSERT INTO fulfillment_ledger (order_id, product_id, quantity)
+          VALUES (${orderId}, ${found.product_id}, ${qty})
+          ON CONFLICT (order_id, product_id) DO NOTHING
+          RETURNING 1;
+        `
+        ).length > 0
 
-      // drempel-check op de NIEUWE waarden
+      if (!firstTime) {
+        // Deze order+product is al verwerkt; sla netjes over.
+        console.info('[FULFILL] duplicate call skipped (idempotent)', {
+          orderId,
+          productId: found.product_id
+        })
+        continue
+      }
+
+      // 3) Verlaag amount (guard tegen negatieve voorraad)
+      const after = (
+        await sql`
+          UPDATE inventory
+          SET amount = amount - ${qty},
+              updated_at = NOW()
+          WHERE product_id = ${found.product_id}
+            AND organization_id = ${organizationId}
+            AND amount >= ${qty}
+          RETURNING amount, threshold, ${found.title} AS title;
+        `
+      )[0]
+
+      if (!after) {
+        // terugdraaien ledger-entry zodat een nieuwe poging later nog kan
+        await sql`
+          DELETE FROM fulfillment_ledger
+          WHERE order_id = ${orderId} AND product_id = ${found.product_id};
+        `
+        throw new Error('amount_too_low')
+      }
+
       if (after.amount <= after.threshold) {
         low.push({ title: after.title, amount: after.amount, threshold: after.threshold })
       }
     }
 
     await sql`COMMIT`
-  } catch (err) {
-    // probeer rollback, maar gooi de originele fout opnieuw
-    await sql`ROLLBACK`.catch(() => {
-      console.warn('[TX] rollback failed (likely no open transaction)')
-    })
-    throw err
+  } catch (e) {
+    await sql`ROLLBACK`.catch(() => {})
+    throw e
   }
 
-  // Cache refresh
+  // Cache verversen (zoals je al deed)
   const fresh = await fetchOrgInventoryFromDB(organizationId)
   setOrgInventory(organizationId, fresh)
 
-  // Bundel “mail” (mock) als iets onder drempel zit
   if (low.length) {
     console.info('[MAIL][threshold_reached]', {
       to: 'ops@example.com',
@@ -267,5 +270,5 @@ export async function fulfillOrder(opts: { organizationId: string; items: Array<
     })
   }
 
-  return { ok: true as const, refreshed: true, lowCount: low.length }
+  return { ok: true as const, lowCount: low.length }
 }
